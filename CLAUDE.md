@@ -80,31 +80,32 @@ Glance/
 
 ## Build Commands
 
-*No source code exists yet — commands will be added as development begins.*
-
-Expected once implemented:
 ```bash
 # Install dependencies
-pnpm install          # or npm install
+pnpm install
 
-# Development
-pnpm tauri dev        # Start Tauri dev server
+# Development (frontend + Tauri)
+pnpm tauri dev
 
-# Build
-pnpm tauri build      # Build production installer
+# Build frontend only
+pnpm build
 
-# Rust tests
+# Build production installer
+pnpm tauri build
+
+# Run Rust tests
 cd src-tauri && cargo test
 
-# Frontend tests
-pnpm test
+# Lint frontend
+pnpm lint
 ```
 
 ## Development Status
 
-This project is in **pre-development / design phase**. The `Docs/` directory contains detailed design and architecture documents (in Chinese) that define the planned implementation. Key docs:
+S1 (Stage 1) implementation in progress. The `Docs/` directory contains detailed design and architecture documents (in Chinese):
 - `Docs/glance_design_document.md` — Product vision, feature scope, MVP definition
 - `Docs/glance_architecture.md` — Technical architecture, schema, data flows
+- `Docs/Actions/S1/` — S1 PR task definitions
 
 ## MVP Scope
 

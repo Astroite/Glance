@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir D:\\\\Project\\\\Astroite\\\\Glance)",
+      "Bash"
+    ]
+  }
+}
