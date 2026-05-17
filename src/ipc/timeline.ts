@@ -8,6 +8,7 @@ export interface PhotoSummary {
   width: number | null;
   height: number | null;
   is_missing: boolean;
+  thumbnail_url: string;
 }
 
 export interface TimelinePage {
@@ -33,7 +34,6 @@ export interface PhotoDetail {
   gps_lon: number | null;
   rating: number | null;
   label: string | null;
-  format: string;
   is_missing: boolean;
   files: PhotoFileInfo[];
 }
@@ -42,6 +42,7 @@ export interface PhotoFileInfo {
   id: number;
   path: string;
   role: string;
+  format: string;
   status: string;
 }
 

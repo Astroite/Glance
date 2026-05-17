@@ -1,8 +1,9 @@
-import { useEffect, useCallback } from 'react';
-import { VirtuosoGrid } from 'react-virtuoso';
+import { useEffect, useCallback, useState, useMemo } from 'react';
+import { GroupedVirtuoso } from 'react-virtuoso';
 import { useTimelineStore } from '../state/useTimelineStore';
 import { useLibraryStore } from '../state/useLibraryStore';
 import { ThumbnailGrid } from '../components/ThumbnailGrid';
+import { Lightbox } from './Lightbox';
 import type { PhotoSummary } from '../ipc';
 
 export function Timeline() {
@@ -17,6 +18,8 @@ export function Timeline() {
     setViewMode,
   } = useTimelineStore();
 
+  const [selectedPhotoId, setSelectedPhotoId] = useState<number | null>(null);
+
   useEffect(() => {
     if (selectedLibrary) {
       loadInitial(selectedLibrary.id);
@@ -29,12 +32,22 @@ export function Timeline() {
     }
   }, [selectedLibrary, hasMore, isLoading, loadMore]);
 
+  const handlePhotoClick = useCallback((photoId: number) => {
+    setSelectedPhotoId(photoId);
+  }, []);
+
+  const handleCloseLightbox = useCallback(() => {
+    setSelectedPhotoId(null);
+  }, []);
+
+  // Group photos by date for Virtuoso group API
+  const { groups, groupCounts, flatPhotos } = useMemo(() => {
+    return buildGroupedData(photos);
+  }, [photos]);
+
   if (!selectedLibrary) {
     return <div className="timeline-empty">Select a library to browse photos</div>;
   }
-
-  // Group photos by date
-  const groupedPhotos = groupPhotosByDate(photos);
 
   return (
     <div className="timeline">
@@ -60,22 +73,22 @@ export function Timeline() {
         {photos.length === 0 && !isLoading ? (
           <div className="empty-state">No photos found in this library</div>
         ) : (
-          <VirtuosoGrid
+          <GroupedVirtuoso
             useWindowScroll
-            totalCount={groupedPhotos.length}
+            groupCounts={groupCounts}
             endReached={handleEndReached}
             overscan={200}
-            components={{
-              ScrollSeekPlaceholder: () => <div className="photo-placeholder" />,
-            }}
-            itemContent={(index) => {
-              const group = groupedPhotos[index];
+            groupContent={(index: number) => (
+              <div className="date-header">{groups[index]}</div>
+            )}
+            itemContent={(index: number) => {
+              const photo = flatPhotos[index];
               return (
-                <div className="date-group">
-                  <div className="date-header">{group.date}</div>
+                <div className="photo-item-wrapper">
                   <ThumbnailGrid
-                    photos={group.photos}
+                    photos={[photo]}
                     viewMode={viewMode}
+                    onPhotoClick={handlePhotoClick}
                   />
                 </div>
               );
@@ -85,17 +98,22 @@ export function Timeline() {
 
         {isLoading && <div className="loading">Loading...</div>}
       </div>
+
+      {selectedPhotoId !== null && (
+        <Lightbox photoId={selectedPhotoId} onClose={handleCloseLightbox} />
+      )}
     </div>
   );
 }
 
-interface DateGroup {
-  date: string;
-  photos: PhotoSummary[];
+interface GroupedData {
+  groups: string[];
+  groupCounts: number[];
+  flatPhotos: PhotoSummary[];
 }
 
-function groupPhotosByDate(photos: PhotoSummary[]): DateGroup[] {
-  const groups: Map<string, PhotoSummary[]> = new Map();
+function buildGroupedData(photos: PhotoSummary[]): GroupedData {
+  const groupMap = new Map<string, PhotoSummary[]>();
 
   for (const photo of photos) {
     const date = photo.taken_at
@@ -106,14 +124,21 @@ function groupPhotosByDate(photos: PhotoSummary[]): DateGroup[] {
         })
       : 'Unknown Date';
 
-    if (!groups.has(date)) {
-      groups.set(date, []);
+    if (!groupMap.has(date)) {
+      groupMap.set(date, []);
     }
-    groups.get(date)!.push(photo);
+    groupMap.get(date)!.push(photo);
   }
 
-  return Array.from(groups.entries()).map(([date, photos]) => ({
-    date,
-    photos,
-  }));
+  const groups: string[] = [];
+  const groupCounts: number[] = [];
+  const flatPhotos: PhotoSummary[] = [];
+
+  for (const [date, datePhotos] of groupMap) {
+    groups.push(date);
+    groupCounts.push(datePhotos.length);
+    flatPhotos.push(...datePhotos);
+  }
+
+  return { groups, groupCounts, flatPhotos };
 }

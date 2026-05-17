@@ -38,3 +38,11 @@ export async function relocateFolder(
 ): Promise<number> {
   return invoke('library_relocate_folder', { libraryId, oldPrefix, newPrefix });
 }
+
+export async function pauseScan(libraryId: number): Promise<void> {
+  return invoke('library_scan_pause', { id: libraryId });
+}
+
+export async function resumeScan(libraryId: number): Promise<ScanJob> {
+  return invoke('library_scan_resume', { id: libraryId });
+}

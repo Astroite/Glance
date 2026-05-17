@@ -215,9 +215,17 @@ button:disabled {
 .date-header {
   font-size: 1.125rem;
   font-weight: 600;
-  margin-bottom: 0.75rem;
-  padding: 0.5rem 0;
+  padding: 0.75rem 0.5rem;
   border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.photo-item-wrapper {
+  display: inline-block;
+  padding: 0.25rem;
 }
 
 /* Thumbnail Grid */

@@ -253,6 +253,10 @@ fn get_exif_rational(exif: &exif::Exif, tag: Tag) -> Option<f64> {
             let r = vec.first()?;
             if r.denom == 0 { None } else { Some(r.num as f64 / r.denom as f64) }
         }
+        Value::SRational(vec) => {
+            let r = vec.first()?;
+            if r.denom == 0 { None } else { Some(r.num as f64 / r.denom as f64) }
+        }
         _ => None,
     }
 }
@@ -261,6 +265,10 @@ fn get_exif_u32(exif: &exif::Exif, tag: Tag) -> Option<u32> {
     let field = exif.get_field(tag, In::PRIMARY)?;
     match &field.value {
         Value::Long(vec) => vec.first().copied(),
+        Value::Short(vec) => vec.first().map(|&v| v as u32),
+        Value::SLong(vec) => vec.first().map(|&v| v as u32),
+        Value::SShort(vec) => vec.first().map(|&v| v as u32),
+        Value::Byte(vec) => vec.first().map(|&v| v as u32),
         _ => None,
     }
 }
@@ -269,6 +277,10 @@ fn get_exif_u16(exif: &exif::Exif, tag: Tag) -> Option<u16> {
     let field = exif.get_field(tag, In::PRIMARY)?;
     match &field.value {
         Value::Short(vec) => vec.first().copied(),
+        Value::Long(vec) => vec.first().map(|&v| v as u16),
+        Value::SShort(vec) => vec.first().map(|&v| v as u16),
+        Value::SLong(vec) => vec.first().map(|&v| v as u16),
+        Value::Byte(vec) => vec.first().map(|&v| v as u16),
         _ => None,
     }
 }

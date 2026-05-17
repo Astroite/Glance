@@ -25,6 +25,18 @@ quick-xml = "0.39"
 chrono = "0.4"
 image = "0.25"
 fast_image_resize = "5"
+webp = "0.3"
+# RAW preview: extracts embedded JPEG, no demosaic. Pure Rust.
+rawler = "0.7.2"
+# Color management: sRGB / ICC profile conversion. Pure Rust.
+qcms = "0.3.0"
+# HEIC support. Requires system libheif (Windows: `vcpkg install libheif`).
+# Enabled via `--features heic`. Off by default so the project builds without vcpkg.
+libheif-rs = { version = "2.7.0", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+default = []
+heic = ["dep:libheif-rs"]

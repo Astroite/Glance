@@ -1,5 +1,3 @@
-import { useState, useEffect } from 'react';
-import { getThumbnailUrl } from '../ipc';
 import type { PhotoSummary } from '../ipc';
 
 interface ThumbnailGridProps {
@@ -15,7 +13,6 @@ export function ThumbnailGrid({ photos, viewMode, onPhotoClick }: ThumbnailGridP
         <ThumbnailItem
           key={photo.id}
           photo={photo}
-          viewMode={viewMode}
           onClick={() => onPhotoClick?.(photo.id)}
         />
       ))}
@@ -25,44 +22,27 @@ export function ThumbnailGrid({ photos, viewMode, onPhotoClick }: ThumbnailGridP
 
 interface ThumbnailItemProps {
   photo: PhotoSummary;
-  viewMode: 'waterfall' | 'grid';
   onClick?: () => void;
 }
 
-function ThumbnailItem({ photo, viewMode, onClick }: ThumbnailItemProps) {
-  const [thumbnailUrl, setThumbnailUrl] = useState<string>('');
-  const [isLoading, setIsLoading] = useState(true);
-
-  useEffect(() => {
-    const loadThumbnail = async () => {
-      try {
-        const tier = viewMode === 'grid' ? 240 : 480;
-        const url = await getThumbnailUrl(photo.id, tier);
-        setThumbnailUrl(url);
-      } catch (err) {
-        console.error('Failed to load thumbnail:', err);
-      } finally {
-        setIsLoading(false);
-      }
-    };
-
-    loadThumbnail();
-  }, [photo.id, viewMode]);
+function ThumbnailItem({ photo, onClick }: ThumbnailItemProps) {
+  // Use the thumbnail_url from PhotoSummary directly — no separate IPC call needed
+  const thumbnailUrl = photo.thumbnail_url;
 
   return (
     <div
       className={`thumbnail-item ${photo.is_missing ? 'missing' : ''}`}
       onClick={onClick}
     >
-      {isLoading ? (
-        <div className="thumbnail-placeholder" />
-      ) : (
-        <img
-          src={thumbnailUrl}
-          alt={`Photo ${photo.id}`}
-          loading="lazy"
-        />
-      )}
+      <img
+        src={thumbnailUrl}
+        alt={`Photo ${photo.id}`}
+        loading="lazy"
+        onError={(e) => {
+          // Fallback to placeholder on error
+          (e.target as HTMLImageElement).style.display = 'none';
+        }}
+      />
       {photo.is_missing && (
         <div className="missing-badge">Missing</div>
       )}

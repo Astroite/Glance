@@ -120,17 +120,19 @@ pub fn group_into_candidates(files: Vec<DiscoveredFile>) -> Vec<PhotoCandidate> 
 
         match file.media_type {
             MediaType::Display => {
-                // Prefer JPEG over other display formats
-                if candidate.display_file.is_none()
-                    || (file.extension == "jpg" || file.extension == "jpeg")
-                {
-                    if let Some(prev) = candidate.display_file.take() {
-                        // Move previous to raw if it was a non-JPEG display
-                        candidate.raw_files.push(prev);
-                    }
+                // B6 fix: prefer JPEG as display, but never push another display into raw_files.
+                // Extra display files become duplicates (stored as pending_displays for later).
+                if candidate.display_file.is_none() {
+                    candidate.display_file = Some(file);
+                } else if file.extension == "jpg" || file.extension == "jpeg" {
+                    // JPEG takes priority as display
+                    let prev = candidate.display_file.take().unwrap();
+                    // Previous display becomes a duplicate sidecar (not raw)
+                    candidate.sidecar_files.push(prev);
                     candidate.display_file = Some(file);
                 } else {
-                    candidate.raw_files.push(file);
+                    // Non-JPEG display when we already have a display — keep as sidecar reference
+                    candidate.sidecar_files.push(file);
                 }
             }
             MediaType::Raw => {

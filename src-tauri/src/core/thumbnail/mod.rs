@@ -1,5 +1,6 @@
+use fast_image_resize::{FilterType, PixelType, Resizer, ResizeOptions};
+use fast_image_resize::images::Image as FirImage;
 use image::codecs::webp::WebPEncoder;
-use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb, RgbImage};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -12,6 +13,9 @@ pub const TIER_LARGE: u32 = 1080;
 /// All thumbnail tiers
 pub const TIERS: &[u32] = &[TIER_SMALL, TIER_MEDIUM, TIER_LARGE];
 
+/// WebP quality for lossy encoding (0-100)
+pub const WEBP_QUALITY: f32 = 85.0;
+
 /// Get the thumbnail file path for a given hash and tier
 /// Format: {thumbs_dir}/{tier}/{hash[0:2]}/{hash}.webp
 pub fn thumbnail_path(thumbs_dir: &Path, tier: u32, hash: &str) -> PathBuf {
@@ -22,10 +26,11 @@ pub fn thumbnail_path(thumbs_dir: &Path, tier: u32, hash: &str) -> PathBuf {
         .join(format!("{}.webp", hash))
 }
 
-/// Generate a placeholder thumbnail for missing files
+/// Generate a placeholder thumbnail for missing files (4:3 ratio)
 pub fn generate_placeholder(tier: u32) -> Vec<u8> {
-    let size = tier;
-    let mut img: RgbImage = ImageBuffer::new(size, size);
+    let width = tier;
+    let height = tier * 3 / 4; // 4:3 ratio
+    let mut img: RgbImage = ImageBuffer::new(width, height);
 
     // Fill with a light gray color
     for pixel in img.pixels_mut() {
@@ -33,21 +38,22 @@ pub fn generate_placeholder(tier: u32) -> Vec<u8> {
     }
 
     // Draw a simple "X" pattern
-    let line_width = (size / 20).max(2);
-    for i in 0..size {
-        for j in 0..size {
-            // Diagonal from top-left to bottom-right
-            if (i as i32 - j as i32).unsigned_abs() < line_width {
+    let line_width = (width.min(height) / 20).max(2);
+    let min_dim = width.min(height) as f64;
+    for i in 0..width {
+        for j in 0..height {
+            let scale_x = i as f64 / width as f64;
+            let scale_y = j as f64 / height as f64;
+            if (scale_x - scale_y).abs() * min_dim < line_width as f64 {
                 img.put_pixel(i, j, Rgb([150, 150, 150]));
             }
-            // Diagonal from top-right to bottom-left
-            if (i as i32 + j as i32 - size as i32).unsigned_abs() < line_width {
+            if ((1.0 - scale_x) - scale_y).abs() * min_dim < line_width as f64 {
                 img.put_pixel(i, j, Rgb([150, 150, 150]));
             }
         }
     }
 
-    encode_webp(&DynamicImage::ImageRgb8(img))
+    encode_webp_lossy(&DynamicImage::ImageRgb8(img))
 }
 
 /// Generate thumbnails for an image at all tiers
@@ -59,6 +65,16 @@ pub fn generate_thumbnails(
 ) -> Result<Vec<(u32, PathBuf)>, String> {
     let img = image::open(image_path)
         .map_err(|e| format!("Failed to open image: {}", e))?;
+
+    // Read ICC profile from source image for color conversion
+    let icc_profile = read_icc_profile(image_path);
+
+    // Convert to sRGB if needed
+    let img = if let Some(icc) = icc_profile {
+        convert_to_srgb(&img, &icc).unwrap_or_else(|| img.clone())
+    } else {
+        img.clone()
+    };
 
     // Apply orientation
     let img = apply_orientation(img, orientation.unwrap_or(1));
@@ -74,11 +90,11 @@ pub fn generate_thumbnails(
                 .map_err(|e| format!("Failed to create directory: {}", e))?;
         }
 
-        // Resize image
-        let resized = resize_to_tier(&img, tier);
+        // Resize image using fast_image_resize
+        let resized = resize_to_tier_fast(&img, tier);
 
-        // Encode to WebP
-        let webp_data = encode_webp(&resized);
+        // Encode to lossy WebP
+        let webp_data = encode_webp_lossy(&resized);
 
         // Write to file
         std::fs::write(&path, webp_data)
@@ -90,8 +106,43 @@ pub fn generate_thumbnails(
     Ok(results)
 }
 
-/// Resize an image to fit within a tier's short edge
-fn resize_to_tier(img: &DynamicImage, tier: u32) -> DynamicImage {
+/// Generate thumbnails from raw JPEG bytes (e.g., embedded JPEG from RAW files).
+/// The bytes should be a valid JPEG/PNG that `image::load_from_memory` can decode.
+pub fn generate_thumbnails_from_bytes(
+    image_bytes: &[u8],
+    thumbs_dir: &Path,
+    hash: &str,
+    orientation: Option<u32>,
+) -> Result<Vec<(u32, PathBuf)>, String> {
+    let img = image::load_from_memory(image_bytes)
+        .map_err(|e| format!("Failed to decode image from bytes: {}", e))?;
+
+    let img = apply_orientation(img, orientation.unwrap_or(1));
+
+    let mut results = Vec::new();
+
+    for &tier in TIERS {
+        let path = thumbnail_path(thumbs_dir, tier, hash);
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create directory: {}", e))?;
+        }
+
+        let resized = resize_to_tier_fast(&img, tier);
+        let webp_data = encode_webp_lossy(&resized);
+
+        std::fs::write(&path, webp_data)
+            .map_err(|e| format!("Failed to write thumbnail: {}", e))?;
+
+        results.push((tier, path));
+    }
+
+    Ok(results)
+}
+
+/// Resize an image to fit within a tier's short edge using fast_image_resize
+fn resize_to_tier_fast(img: &DynamicImage, tier: u32) -> DynamicImage {
     let (width, height) = img.dimensions();
     let short_edge = width.min(height);
 
@@ -103,11 +154,141 @@ fn resize_to_tier(img: &DynamicImage, tier: u32) -> DynamicImage {
     let new_width = (width as f64 * scale).round() as u32;
     let new_height = (height as f64 * scale).round() as u32;
 
-    img.resize_exact(new_width, new_height, FilterType::Lanczos3)
+    // Convert to RGBA8 for fast_image_resize
+    let rgba = img.to_rgba8();
+    let src_image = FirImage::from_vec_u8(
+        width,
+        height,
+        rgba.to_vec(),
+        PixelType::U8x4,
+    ).expect("Failed to create source image");
+
+    let mut dst_image = FirImage::new(new_width, new_height, PixelType::U8x4);
+
+    let mut resizer = Resizer::new();
+    let resize_options = ResizeOptions::new()
+        .resize_alg(fast_image_resize::ResizeAlg::Convolution(FilterType::Lanczos3));
+
+    resizer.resize(&src_image, &mut dst_image, &resize_options)
+        .expect("Failed to resize image");
+
+    // Convert back to DynamicImage
+    let raw = dst_image.buffer().to_vec();
+    let img_buffer = ImageBuffer::<image::Rgba<u8>, _>::from_raw(new_width, new_height, raw)
+        .expect("Failed to create image buffer");
+    DynamicImage::ImageRgba8(img_buffer)
+}
+
+/// Encode an image to lossy WebP format
+fn encode_webp_lossy(img: &DynamicImage) -> Vec<u8> {
+    let rgb = img.to_rgb8();
+    let mut cursor = Cursor::new(Vec::new());
+    let encoder = WebPEncoder::new_lossless(&mut cursor);
+    use image::ExtendedColorType;
+    encoder.encode(rgb.as_raw(), rgb.width(), rgb.height(), ExtendedColorType::Rgb8).unwrap_or(());
+    let lossless_data = cursor.into_inner();
+
+    // Try to use the webp crate for lossy encoding
+    // If it fails (e.g., not available), fall back to lossless
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    match webp::Encoder::from_rgba(rgba.as_raw(), w, h).encode(WEBP_QUALITY) {
+        encoded if !encoded.is_empty() => encoded.to_vec(),
+        _ => lossless_data,
+    }
+}
+
+/// Read ICC profile from an image file
+fn read_icc_profile(path: &Path) -> Option<Vec<u8>> {
+    let data = std::fs::read(path).ok()?;
+    // Look for ICC profile in JPEG APP2 marker
+    if data.len() > 2 && data[0] == 0xFF && data[1] == 0xD8 {
+        return extract_jpeg_icc(&data);
+    }
+    // For PNG, look for iCCP chunk
+    if data.len() > 8 && &data[0..8] == b"\x89PNG\r\n\x1a\n" {
+        return extract_png_icc(&data);
+    }
+    None
+}
+
+/// Extract ICC profile from JPEG APP2 markers
+fn extract_jpeg_icc(data: &[u8]) -> Option<Vec<u8> > {
+    let mut i = 2; // Skip SOI
+    while i + 4 < data.len() {
+        if data[i] != 0xFF {
+            break;
+        }
+        let marker = data[i + 1];
+        if marker == 0xDA {
+            break; // Start of scan
+        }
+        let len = ((data[i + 2] as usize) << 8) | (data[i + 3] as usize);
+        if marker == 0xE2 && len > 14 {
+            // APP2 marker - check for ICC profile
+            let header = &data[i + 4..i + 4 + 12];
+            if header == b"ICC_PROFILE\0" {
+                // Found ICC profile data
+                let icc_data = &data[i + 4 + 14..i + 2 + len];
+                return Some(icc_data.to_vec());
+            }
+        }
+        i += 2 + len;
+    }
+    None
+}
+
+/// Extract ICC profile from PNG iCCP chunk
+fn extract_png_icc(data: &[u8]) -> Option<Vec<u8>> {
+    let mut i = 8; // Skip PNG signature
+    while i + 8 < data.len() {
+        let length = ((data[i] as usize) << 24)
+            | ((data[i + 1] as usize) << 16)
+            | ((data[i + 2] as usize) << 8)
+            | (data[i + 3] as usize);
+        let chunk_type = &data[i + 4..i + 8];
+        if chunk_type == b"iCCP" {
+            // iCCP chunk: name (null-terminated) + compression method + compressed profile
+            let chunk_data = &data[i + 8..i + 8 + length];
+            // Skip name (find null terminator)
+            if let Some(null_pos) = chunk_data.iter().position(|&b| b == 0) {
+                let compression = chunk_data.get(null_pos + 1)?;
+                if *compression == 0 {
+                    // zlib compressed - we'd need to decompress
+                    // For now, skip this and let the fallback handle it
+                    return None;
+                }
+            }
+        }
+        i += 12 + length; // 4 (length) + 4 (type) + data + 4 (crc)
+    }
+    None
+}
+
+/// Convert an image from source ICC profile to sRGB using qcms
+fn convert_to_srgb(img: &DynamicImage, icc_data: &[u8]) -> Option<DynamicImage> {
+    let input_profile = qcms::Profile::new_from_slice(icc_data, false)?;
+    let srgb_profile = qcms::Profile::new_sRGB();
+
+    let transform = qcms::Transform::new(
+        &input_profile,
+        &srgb_profile,
+        qcms::DataType::RGB8,
+        qcms::Intent::Perceptual,
+    )?;
+
+    // Apply transform in-place on RGB data
+    let rgb = img.to_rgb8();
+    let (w, h) = rgb.dimensions();
+    let mut data = rgb.as_raw().to_vec();
+    transform.apply(&mut data);
+
+    let img_buffer = ImageBuffer::<image::Rgb<u8>, _>::from_raw(w, h, data)?;
+    Some(DynamicImage::ImageRgb8(img_buffer))
 }
 
 /// Apply EXIF orientation to an image
-fn apply_orientation(img: DynamicImage, orientation: u32) -> DynamicImage {
+pub fn apply_orientation(img: DynamicImage, orientation: u32) -> DynamicImage {
     match orientation {
         1 => img,
         2 => img.flipv(),
@@ -119,16 +300,6 @@ fn apply_orientation(img: DynamicImage, orientation: u32) -> DynamicImage {
         8 => img.rotate270(),
         _ => img,
     }
-}
-
-/// Encode an image to WebP format
-fn encode_webp(img: &DynamicImage) -> Vec<u8> {
-    use image::ExtendedColorType;
-    let rgb = img.to_rgb8();
-    let mut cursor = Cursor::new(Vec::new());
-    let encoder = WebPEncoder::new_lossless(&mut cursor);
-    encoder.encode(rgb.as_raw(), rgb.width(), rgb.height(), ExtendedColorType::Rgb8).unwrap_or(());
-    cursor.into_inner()
 }
 
 #[cfg(test)]
@@ -159,9 +330,9 @@ mod tests {
     }
 
     #[test]
-    fn test_resize_to_tier() {
+    fn test_resize_to_tier_fast() {
         let img = create_test_image(6000, 4000);
-        let resized = resize_to_tier(&img, 240);
+        let resized = resize_to_tier_fast(&img, 240);
         let (w, h) = resized.dimensions();
         // Short edge (4000) should be resized to 240
         assert_eq!(h, 240);
@@ -171,7 +342,7 @@ mod tests {
     #[test]
     fn test_resize_small_image_unchanged() {
         let img = create_test_image(100, 80);
-        let resized = resize_to_tier(&img, 240);
+        let resized = resize_to_tier_fast(&img, 240);
         let (w, h) = resized.dimensions();
         assert_eq!(w, 100);
         assert_eq!(h, 80);
@@ -195,9 +366,9 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_webp() {
+    fn test_encode_webp_lossy() {
         let img = create_test_image(100, 100);
-        let data = encode_webp(&img);
+        let data = encode_webp_lossy(&img);
         assert!(!data.is_empty());
         // WebP magic bytes
         assert_eq!(&data[0..4], b"RIFF");
@@ -209,6 +380,16 @@ mod tests {
         assert!(!data.is_empty());
         // Should be valid WebP
         assert_eq!(&data[0..4], b"RIFF");
+    }
+
+    #[test]
+    fn test_placeholder_4_3_ratio() {
+        let data = generate_placeholder(240);
+        // Decode and check dimensions
+        let img = image::load_from_memory(&data).unwrap();
+        let (w, h) = img.dimensions();
+        assert_eq!(w, 240);
+        assert_eq!(h, 180); // 240 * 3/4 = 180
     }
 
     #[test]
@@ -228,5 +409,14 @@ mod tests {
             assert!(path.exists());
             assert!(path.to_string_lossy().contains(&tier.to_string()));
         }
+    }
+
+    #[test]
+    fn test_lossy_encoding() {
+        let img = create_test_image(2000, 1500);
+        let lossy = encode_webp_lossy(&img);
+        assert!(!lossy.is_empty());
+        // Should be valid WebP
+        assert_eq!(&lossy[0..4], b"RIFF");
     }
 }
