@@ -223,23 +223,12 @@ button:disabled {
   z-index: 10;
 }
 
-.photo-item-wrapper {
-  display: inline-block;
-  padding: 0.25rem;
-}
-
-/* Thumbnail Grid */
-.thumbnail-grid {
+/* Photo Row — each row is a grid line of thumbnails */
+.photo-row {
   display: grid;
+  grid-template-columns: repeat(var(--cols), 1fr);
   gap: 0.5rem;
-}
-
-.thumbnail-grid.grid {
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-}
-
-.thumbnail-grid.waterfall {
-  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  padding: 0.25rem 0;
 }
 
 .thumbnail-item {
