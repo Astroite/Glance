@@ -4,7 +4,10 @@ pub mod error;
 
 use commands::AppState;
 use core::db::{self, thumbs_dir};
+use core::tasks::TaskQueue;
 use core::thumbnail;
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -20,20 +23,44 @@ pub fn run() {
             // Initialize app data directory
             db::init_app_data_dir().expect("Failed to initialize app data directory");
 
-            // Create DB connection
+            // Run migrations once with a throwaway connection (migrations should not run per
+            // pooled connection).
             let db_path = db::db_path();
-            let conn = db::create_connection(&db_path).expect("Failed to create database connection");
-            db::run_migrations(&conn).expect("Failed to run database migrations");
+            {
+                let conn = db::create_connection(&db_path)
+                    .expect("Failed to create database connection");
+                db::run_migrations(&conn).expect("Failed to run database migrations");
+            }
 
-            // Inject app state
+            // Build pool. Every new connection gets the same pragmas as `create_connection`.
+            let manager = SqliteConnectionManager::file(&db_path).with_init(|c| {
+                c.execute_batch("PRAGMA journal_mode=WAL;")?;
+                c.execute_batch("PRAGMA foreign_keys=ON;")?;
+                Ok(())
+            });
+            let pool = Pool::builder()
+                .max_size(10)
+                .build(manager)
+                .expect("Failed to build SQLite connection pool");
+
+            // Build the background TaskQueue. Worker threads spawn immediately,
+            // so the handler must be Send + Sync + 'static — we capture pool
+            // and thumbs_dir by move.
+            let cpu_workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            let handler = commands::make_task_handler(pool.clone(), thumbs_dir());
+            let queue = Arc::new(TaskQueue::new(3, cpu_workers, handler));
+
             app.manage(AppState {
-                db: Arc::new(Mutex::new(conn)),
+                db: pool,
                 scan_cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
+                task_queue: queue,
             });
 
             Ok(())
         })
-        .register_uri_scheme_protocol("asset", |_app, request| {
+        .register_uri_scheme_protocol("asset", |app, request| {
             // Parse asset://thumb/{photoId}/{tier}
             let uri = request.uri();
             let path = uri.path();
@@ -65,23 +92,22 @@ pub fn run() {
                 }
             };
 
-            // Look up the thumbnail in the DB
+            // Look up the thumbnail in the DB via the shared pool
             let thumbs = thumbs_dir();
+            let state = app.app_handle().state::<AppState>();
 
-            // Try to get the thumbnail hash from DB
-            let thumb_result = {
-                // We need to access the DB - get it from app state
-                // Since we're in the protocol handler, we need to use a static DB path
-                let db_path = db::db_path();
-                if let Ok(conn) = db::create_connection(&db_path) {
-                    conn.query_row(
+            let thumb_result = match state.db.get() {
+                Ok(conn) => conn
+                    .query_row(
                         "SELECT source_hash FROM thumbnails WHERE photo_id = ?1 AND tier = ?2",
                         rusqlite::params![photo_id, tier],
                         |row| row.get::<_, String>(0),
                     )
-                    .ok()
-                } else {
-                    None
+                    .ok(),
+                Err(_) => {
+                    let mut response = tauri::http::Response::new(Vec::new());
+                    *response.status_mut() = tauri::http::StatusCode::INTERNAL_SERVER_ERROR;
+                    return response;
                 }
             };
 
@@ -103,20 +129,17 @@ pub fn run() {
             }
 
             // If thumbnail not found in DB, try to find it by looking up the photo's display file hash
-            let display_hash_result = {
-                let db_path = db::db_path();
-                if let Ok(conn) = db::create_connection(&db_path) {
-                    conn.query_row(
+            let display_hash_result = match state.db.get() {
+                Ok(conn) => conn
+                    .query_row(
                         "SELECT pf.content_hash FROM photos p
                          JOIN photo_files pf ON p.display_file_id = pf.id
                          WHERE p.id = ?1",
                         [photo_id],
                         |row| row.get::<_, String>(0),
                     )
-                    .ok()
-                } else {
-                    None
-                }
+                    .ok(),
+                Err(_) => None,
             };
 
             if let Some(hash) = display_hash_result {
@@ -136,8 +159,7 @@ pub fn run() {
                 }
 
                 // Try to generate on the fly
-                let db_path = db::db_path();
-                if let Ok(conn) = db::create_connection(&db_path) {
+                if let Ok(conn) = state.db.get() {
                     if let Ok(Some((display_path, display_format))) = conn.query_row(
                         "SELECT pf.path, pf.format FROM photos p
                          JOIN photo_files pf ON p.display_file_id = pf.id

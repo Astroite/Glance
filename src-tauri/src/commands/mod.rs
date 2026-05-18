@@ -1,13 +1,17 @@
 use crate::core::db::dao;
-use crate::core::db::thumbs_dir;
 use crate::core::raw;
 use crate::core::scanner::orchestrator;
+use crate::core::tasks::{Task, TaskQueue};
 use crate::core::thumbnail;
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::Connection;
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+
+pub type DbPool = Pool<SqliteConnectionManager>;
 
 /// RAW formats that need embedded JPEG extraction for thumbnails
 const RAW_FORMATS: &[&str] = &["arw", "cr2", "cr3", "nef", "orf", "rw2", "dng", "raf"];
@@ -19,8 +23,9 @@ pub fn is_raw_format(format: &str) -> bool {
 
 /// Application state shared across all Tauri commands.
 pub struct AppState {
-    pub db: Arc<Mutex<Connection>>,
+    pub db: DbPool,
     pub scan_cancel_tokens: Arc<Mutex<std::collections::HashMap<i64, orchestrator::CancellationToken>>>,
+    pub task_queue: Arc<TaskQueue>,
 }
 
 #[derive(Serialize)]
@@ -75,7 +80,7 @@ pub struct PhotoFileInfo {
 
 #[tauri::command]
 pub fn library_list(state: tauri::State<'_, AppState>) -> Result<Vec<dao::Library>, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.get().map_err(|e| format!("Failed to get DB connection: {}", e))?;
     dao::list_libraries(&conn).map_err(|e| e.to_string())
 }
 
@@ -89,7 +94,7 @@ pub fn library_add(state: tauri::State<'_, AppState>, path: String) -> Result<da
         return Err(format!("Path is not a directory: {}", path));
     }
 
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.get().map_err(|e| format!("Failed to get DB connection: {}", e))?;
 
     let name = p
         .file_name()
@@ -101,7 +106,7 @@ pub fn library_add(state: tauri::State<'_, AppState>, path: String) -> Result<da
 
 #[tauri::command]
 pub fn library_scan(state: tauri::State<'_, AppState>, id: i64) -> Result<dao::ScanJob, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.get().map_err(|e| format!("Failed to get DB connection: {}", e))?;
     let library = dao::get_library(&conn, id).map_err(|e| format!("Library not found: {}", e))?;
 
     let root = Path::new(&library.root_path);
@@ -127,8 +132,12 @@ pub fn library_scan(state: tauri::State<'_, AppState>, id: i64) -> Result<dao::S
 
     result?;
 
-    // After scan, generate thumbnails for newly added photos
-    generate_thumbnails_for_library(&conn, id)?;
+    // Hand thumbnail generation off to the background TaskQueue so the IPC
+    // call returns immediately and the CPU pool can parallelize the work.
+    let pending = pending_thumbnail_photo_ids(&conn, id)?;
+    if !pending.is_empty() {
+        state.task_queue.enqueue(Task::ThumbnailPrefetch { photo_ids: pending });
+    }
 
     let job = get_latest_scan_job(&conn, id)?;
     Ok(job)
@@ -147,7 +156,7 @@ pub fn library_scan_pause(state: tauri::State<'_, AppState>, id: i64) -> Result<
 
 #[tauri::command]
 pub fn library_scan_resume(state: tauri::State<'_, AppState>, id: i64) -> Result<dao::ScanJob, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.get().map_err(|e| format!("Failed to get DB connection: {}", e))?;
     let library = dao::get_library(&conn, id).map_err(|e| format!("Library not found: {}", e))?;
 
     let root = Path::new(&library.root_path);
@@ -178,42 +187,62 @@ pub fn library_scan_resume(state: tauri::State<'_, AppState>, id: i64) -> Result
 
     result?;
 
-    generate_thumbnails_for_library(&conn, id)?;
+    let pending = pending_thumbnail_photo_ids(&conn, id)?;
+    if !pending.is_empty() {
+        state.task_queue.enqueue(Task::ThumbnailPrefetch { photo_ids: pending });
+    }
 
     let job = get_latest_scan_job(&conn, id)?;
     Ok(job)
 }
 
-fn generate_thumbnails_for_library(conn: &Connection, library_id: i64) -> Result<(), String> {
-    let thumbs = thumbs_dir();
-
-    // Find photos without thumbnails, including the display file format
+/// Find photos in this library that don't yet have all three thumbnail tiers.
+fn pending_thumbnail_photo_ids(conn: &Connection, library_id: i64) -> Result<Vec<i64>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT p.id, p.orientation, pf.content_hash, pf.path, pf.id, pf.format
-             FROM photos p
-             JOIN photo_files pf ON p.display_file_id = pf.id
+            "SELECT p.id FROM photos p
+             LEFT JOIN thumbnails t ON t.photo_id = p.id
              WHERE p.library_id = ?1
-             AND NOT EXISTS (SELECT 1 FROM thumbnails t WHERE t.photo_id = p.id AND t.tier = 240)",
+             GROUP BY p.id
+             HAVING COUNT(t.tier) < 3",
         )
         .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params![library_id], |row| row.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
 
-    let rows: Vec<(i64, Option<i64>, String, String, i64, String)> = stmt
-        .query_map(rusqlite::params![library_id], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-            ))
-        })
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
-        .collect();
+/// Generate all three thumbnail tiers for each photo_id, using a fresh pool
+/// connection. Invoked from the TaskQueue handler on the CPU pool; errors are
+/// logged and skipped — a panic here would kill the worker thread.
+pub fn run_thumbnail_prefetch(pool: &DbPool, thumbs: &Path, photo_ids: &[i64]) {
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ThumbnailPrefetch: failed to acquire DB connection: {}", e);
+            return;
+        }
+    };
 
-    for (photo_id, orientation, hash, path, display_file_id, format) in rows {
+    for &photo_id in photo_ids {
+        let row: rusqlite::Result<(Option<i64>, String, String, i64, String)> = conn.query_row(
+            "SELECT p.orientation, pf.content_hash, pf.path, pf.id, pf.format
+             FROM photos p
+             JOIN photo_files pf ON p.display_file_id = pf.id
+             WHERE p.id = ?1",
+            [photo_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        );
+
+        let (orientation, hash, path, display_file_id, format) = match row {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("ThumbnailPrefetch: photo {} lookup failed: {}", photo_id, e);
+                continue;
+            }
+        };
+
         let img_path = Path::new(&path);
         if !img_path.exists() {
             continue;
@@ -221,43 +250,57 @@ fn generate_thumbnails_for_library(conn: &Connection, library_id: i64) -> Result
 
         let orient = orientation.map(|o| o as u32).unwrap_or(1);
 
-        // For RAW display files, extract embedded JPEG first
         let result = if RAW_FORMATS.contains(&format.as_str()) {
             match raw::extract_embedded_jpeg(img_path) {
                 Ok(jpeg_bytes) => {
-                    thumbnail::generate_thumbnails_from_bytes(&jpeg_bytes, &thumbs, &hash, Some(orient))
+                    thumbnail::generate_thumbnails_from_bytes(&jpeg_bytes, thumbs, &hash, Some(orient))
                 }
                 Err(e) => {
-                    eprintln!("Failed to extract embedded JPEG from RAW {}: {}", path, e);
-                    // Fall back to trying direct open (works for some DNG files)
-                    thumbnail::generate_thumbnails(img_path, &thumbs, &hash, Some(orient))
+                    eprintln!("ThumbnailPrefetch: embedded JPEG extract failed for {}: {}", path, e);
+                    thumbnail::generate_thumbnails(img_path, thumbs, &hash, Some(orient))
                 }
             }
         } else {
-            thumbnail::generate_thumbnails(img_path, &thumbs, &hash, Some(orient))
+            thumbnail::generate_thumbnails(img_path, thumbs, &hash, Some(orient))
         };
 
         match result {
-            Ok(results) => {
-                for (tier, _) in results {
-                    let _ = dao::insert_thumbnail(
-                        conn,
+            Ok(thumbs_out) => {
+                for thumb in thumbs_out {
+                    if let Err(e) = dao::insert_thumbnail(
+                        &conn,
                         photo_id,
                         display_file_id,
                         &hash,
-                        tier as i64,
-                        tier as i64,
-                        tier as i64,
-                    );
+                        thumb.tier as i64,
+                        thumb.width as i64,
+                        thumb.height as i64,
+                    ) {
+                        eprintln!("ThumbnailPrefetch: insert_thumbnail failed for photo {}: {}", photo_id, e);
+                    }
                 }
             }
             Err(e) => {
-                eprintln!("Failed to generate thumbnails for photo {}: {}", photo_id, e);
+                eprintln!("ThumbnailPrefetch: thumbnail gen failed for photo {}: {}", photo_id, e);
             }
         }
     }
+}
 
-    Ok(())
+/// Construct the handler closure used by the lib-wide TaskQueue. Kept as a
+/// constructor so the same closure logic can be reused from tests.
+pub fn make_task_handler(
+    pool: DbPool,
+    thumbs: PathBuf,
+) -> impl Fn(&Task, &crate::core::tasks::CancellationToken) + Send + Sync + 'static {
+    move |task, _cancel| match task {
+        Task::ThumbnailPrefetch { photo_ids } => {
+            run_thumbnail_prefetch(&pool, &thumbs, photo_ids);
+        }
+        other => {
+            eprintln!("TaskQueue: variant {:?} not yet wired", other);
+        }
+    }
 }
 
 fn get_latest_scan_job(conn: &Connection, library_id: i64) -> Result<dao::ScanJob, String> {
@@ -289,7 +332,7 @@ pub fn library_relocate_folder(
     old_prefix: String,
     new_prefix: String,
 ) -> Result<i64, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.get().map_err(|e| format!("Failed to get DB connection: {}", e))?;
     orchestrator::relocate_folder(&conn, library_id, &old_prefix, &new_prefix)
 }
 
@@ -300,7 +343,7 @@ pub fn timeline_query(
     cursor: Option<String>,
     limit: Option<i64>,
 ) -> Result<TimelinePage, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.get().map_err(|e| format!("Failed to get DB connection: {}", e))?;
     let limit = limit.unwrap_or(200);
 
     let (cursor_taken_at, cursor_photo_id) = if let Some(ref c) = cursor {
@@ -408,7 +451,7 @@ fn parse_cursor(cursor: &str) -> Result<(Option<i64>, Option<i64>), String> {
 
 #[tauri::command]
 pub fn photo_detail(state: tauri::State<'_, AppState>, id: i64) -> Result<PhotoDetail, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.get().map_err(|e| format!("Failed to get DB connection: {}", e))?;
 
     let photo = dao::get_photo(&conn, id).map_err(|e| format!("Photo not found: {}", e))?;
 
@@ -464,7 +507,7 @@ pub fn photo_relocate_file(
     photo_file_id: i64,
     new_path: String,
 ) -> Result<(), String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.get().map_err(|e| format!("Failed to get DB connection: {}", e))?;
     orchestrator::relocate_file(&conn, photo_file_id, Path::new(&new_path))
 }
 
@@ -474,7 +517,7 @@ pub fn thumbnail_url(
     photo_id: i64,
     tier: i64,
 ) -> Result<String, String> {
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = state.db.get().map_err(|e| format!("Failed to get DB connection: {}", e))?;
     let _ = dao::get_photo(&conn, photo_id).map_err(|e| format!("Photo not found: {}", e))?;
     Ok(format!("asset://thumb/{}/{}", photo_id, tier))
 }

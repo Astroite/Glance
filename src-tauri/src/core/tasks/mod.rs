@@ -415,6 +415,93 @@ mod tests {
     }
 
     #[test]
+    fn test_thumbnail_prefetch_via_queue() {
+        use crate::commands::make_task_handler;
+        use crate::core::db;
+        use crate::core::db::dao;
+        use image::{ImageBuffer, Rgb, RgbImage};
+        use r2d2::Pool;
+        use r2d2_sqlite::SqliteConnectionManager;
+        use std::time::Instant;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.sqlite");
+        let thumbs_dir = tmp.path().join("thumbs");
+
+        // Initialize schema with a throwaway connection.
+        {
+            let conn = db::create_connection(&db_path).unwrap();
+            db::run_migrations(&conn).unwrap();
+        }
+
+        // Real JPEG so generate_thumbnails can decode it.
+        let img_path = tmp.path().join("test.jpg");
+        let img: RgbImage = ImageBuffer::from_fn(800, 600, |x, y| {
+            Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+        });
+        img.save(&img_path).unwrap();
+
+        let manager = SqliteConnectionManager::file(&db_path);
+        let pool = Pool::builder().max_size(2).build(manager).unwrap();
+
+        let photo_id = {
+            let conn = pool.get().unwrap();
+            let lib = dao::insert_library(&conn, "test", tmp.path().to_str().unwrap()).unwrap();
+            let photo = dao::insert_photo(&conn, lib.id, None, None).unwrap();
+            let file = dao::insert_photo_file(
+                &conn,
+                lib.id,
+                photo.id,
+                img_path.to_str().unwrap(),
+                "testhashabc",
+                100,
+                0,
+                "display",
+                "jpg",
+                None,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE photos SET display_file_id = ?1 WHERE id = ?2",
+                rusqlite::params![file.id, photo.id],
+            )
+            .unwrap();
+            photo.id
+        };
+
+        let handler = make_task_handler(pool.clone(), thumbs_dir.clone());
+        let queue = TaskQueue::new(1, 1, handler);
+
+        queue.enqueue(Task::ThumbnailPrefetch { photo_ids: vec![photo_id] });
+
+        // Poll the actual DB state — queue depth dropping to 0 only means the
+        // task was dequeued, not that thumbnails are written yet.
+        let start = Instant::now();
+        loop {
+            let conn = pool.get().unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM thumbnails WHERE photo_id = ?1",
+                    [photo_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if count >= 3 {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(5) {
+                panic!(
+                    "ThumbnailPrefetch did not write 3 rows within 5s (got {})",
+                    count
+                );
+            }
+            drop(conn);
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
     fn test_queue_depth() {
         let queue = TaskQueue::new(1, 1, |_task, _cancel| {
             thread::sleep(Duration::from_millis(100));
