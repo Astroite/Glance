@@ -53,8 +53,12 @@ pub fn run_scan(
     let mut last_dir: Option<PathBuf> = None;
     let mut skipped_past_cursor = cursor.is_none();
 
-    // Use WalkDir iterator — don't collect all files into memory
-    let walker = walkdir::WalkDir::new(root_path).follow_links(false);
+    // Use WalkDir iterator — don't collect all files into memory.
+    // sort_by_file_name() ensures cursor's lexicographic comparison is stable
+    // across filesystems (NTFS/ext4 default ordering is implementation-defined).
+    let walker = walkdir::WalkDir::new(root_path)
+        .follow_links(false)
+        .sort_by_file_name();
 
     // We need to group files by (dir, stem) as we walk.
     // Strategy: accumulate files per directory, flush when directory changes.
@@ -84,11 +88,14 @@ pub fn run_scan(
 
         let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
 
-        // Cursor skip: if resuming, skip files whose path is before the cursor
+        // Cursor skip: if resuming, skip files whose directory (relative to root)
+        // is strictly less than the cursor. Cursor stores the last successfully
+        // processed directory as a relative path; equal dirs are reprocessed
+        // (UPSERT is idempotent).
         if !skipped_past_cursor {
             if let Some(ref cur) = cursor {
-                let rel_path = path.strip_prefix(root_path).unwrap_or(path);
-                if rel_path.to_string_lossy().as_ref() < cur.as_str() {
+                let rel_dir = dir.strip_prefix(root_path).unwrap_or(&dir).to_string_lossy();
+                if rel_dir.as_ref() < cur.as_str() {
                     continue;
                 }
                 skipped_past_cursor = true;
@@ -107,7 +114,10 @@ pub fn run_scan(
 
         // If batch is large enough, process it
         if batch.len() >= BATCH_SIZE {
-            let batch_dir = current_dir.as_ref().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
+            let batch_dir = current_dir
+                .as_ref()
+                .map(|d| d.strip_prefix(root_path).unwrap_or(d).to_string_lossy().to_string())
+                .unwrap_or_default();
             process_batch(conn, library_id, job.id, &batch, &mut added, &mut updated)?;
             dao::update_scan_job_cursor(conn, job.id, &batch_dir)
                 .map_err(|e| format!("Failed to update cursor: {}", e))?;
@@ -123,7 +133,10 @@ pub fn run_scan(
 
     // Process final batch
     if !batch.is_empty() {
-        let batch_dir = last_dir.as_ref().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
+        let batch_dir = last_dir
+            .as_ref()
+            .map(|d| d.strip_prefix(root_path).unwrap_or(d).to_string_lossy().to_string())
+            .unwrap_or_default();
         process_batch(conn, library_id, job.id, &batch, &mut added, &mut updated)?;
         dao::update_scan_job_cursor(conn, job.id, &batch_dir)
             .map_err(|e| format!("Failed to update cursor: {}", e))?;
@@ -384,12 +397,12 @@ fn update_existing_photo(
                 dao::update_photo_file_last_seen(conn, existing.id, Some(scan_job_id))
                     .map_err(|e| format!("Failed to update last_seen: {}", e))?;
 
-                if *role == FileRole::Display || *role == FileRole::Sidecar {
-                    if existing.mtime != identity.mtime {
-                        refresh_metadata(conn, library_id, photo_id, roles)?;
-                    }
+                if (*role == FileRole::Display || *role == FileRole::Sidecar)
+                    && existing.mtime != identity.mtime
+                {
+                    refresh_metadata(conn, library_id, photo_id, roles)?;
+                    changed = true;
                 }
-                changed = true;
             } else {
                 dao::update_photo_file_status(conn, existing.id, "missing")
                     .map_err(|e| format!("Failed to mark missing: {}", e))?;
@@ -584,8 +597,8 @@ mod tests {
             let orient = orientation.map(|o| o as u32).unwrap_or(1);
             match crate::core::thumbnail::generate_thumbnails(img_path, &thumbs, &hash, Some(orient)) {
                 Ok(results) => {
-                    for (tier, _) in results {
-                        let _ = dao::insert_thumbnail(conn, photo_id, display_file_id, &hash, tier as i64, tier as i64, tier as i64);
+                    for thumb in results {
+                        let _ = dao::insert_thumbnail(conn, photo_id, display_file_id, &hash, thumb.tier as i64, thumb.width as i64, thumb.height as i64);
                     }
                 }
                 Err(e) => eprintln!("Thumbnail gen failed for {}: {}", photo_id, e),
@@ -652,7 +665,7 @@ mod tests {
 
         let result2 = run_scan(&conn, lib_id, tmp.path(), None, None).unwrap();
         assert_eq!(result2.added, 0);
-        assert_eq!(result2.updated, 1);
+        assert_eq!(result2.updated, 0);
         assert_eq!(result2.missing, 0);
     }
 
@@ -720,6 +733,42 @@ mod tests {
         let jobs = dao::get_resumable_scan_jobs(&conn, lib_id).unwrap();
         // Job should be done, not resumable
         assert_eq!(jobs.len(), 0);
+    }
+
+    #[test]
+    fn test_resume_skips_files_before_cursor() {
+        let (tmp, conn, lib_id) = setup_test_library();
+
+        // Three sibling subdirectories, each with one JPEG. With
+        // sort_by_file_name() enabled, walkdir visits them as a < b < c.
+        for name in &["a", "b", "c"] {
+            let sub = tmp.path().join(name);
+            std::fs::create_dir(&sub).unwrap();
+            create_test_image(&sub, "photo.jpg", format!("data {}", name).as_bytes());
+        }
+
+        // First full scan: all three photos added.
+        let r1 = run_scan(&conn, lib_id, tmp.path(), None, None).unwrap();
+        assert_eq!(r1.added, 3);
+
+        // Resurrect the just-completed job as paused with cursor at relative dir "b".
+        let job_id: i64 = conn.query_row(
+            "SELECT id FROM scan_jobs WHERE library_id = ?1 ORDER BY id DESC LIMIT 1",
+            [lib_id],
+            |row| row.get(0),
+        ).unwrap();
+        conn.execute("UPDATE scan_jobs SET status = 'paused', finished_at = NULL WHERE id = ?1", [job_id]).unwrap();
+        dao::update_scan_job_cursor(&conn, job_id, "b").unwrap();
+
+        // Wipe photo state so `added` on resume reflects exactly which dirs were walked.
+        // photos.display_file_id -> photo_files.id has no ON DELETE; null it first, then
+        // cascade through photos (photo_files.photo_id has ON DELETE CASCADE).
+        conn.execute("UPDATE photos SET display_file_id = NULL", []).unwrap();
+        conn.execute("DELETE FROM photos", []).unwrap();
+
+        // Resume: cursor="b" must skip dir "a" (rel "a" < "b") and process b, c.
+        let r2 = run_scan(&conn, lib_id, tmp.path(), None, Some(job_id)).unwrap();
+        assert_eq!(r2.added, 2, "resume should re-add only b and c, skipping a");
     }
 
     #[test]
@@ -817,6 +866,7 @@ mod tests {
 
     /// Integration test: scan a real photo directory end-to-end
     #[test]
+    #[ignore = "requires real photo library at E:\\TEMP\\Photos\\Share — run with --ignored locally"]
     fn test_e2e_real_photo_directory() {
         let real_dir = std::path::PathBuf::from(r"E:\TEMP\Photos\Share");
         if !real_dir.exists() {

@@ -1,8 +1,6 @@
 use fast_image_resize::{FilterType, PixelType, Resizer, ResizeOptions};
 use fast_image_resize::images::Image as FirImage;
-use image::codecs::webp::WebPEncoder;
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb, RgbImage};
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 /// Thumbnail tier sizes (short edge in pixels)
@@ -15,6 +13,14 @@ pub const TIERS: &[u32] = &[TIER_SMALL, TIER_MEDIUM, TIER_LARGE];
 
 /// WebP quality for lossy encoding (0-100)
 pub const WEBP_QUALITY: f32 = 85.0;
+
+/// A generated thumbnail with its real dimensions
+pub struct GeneratedThumbnail {
+    pub tier: u32,
+    pub path: PathBuf,
+    pub width: u32,
+    pub height: u32,
+}
 
 /// Get the thumbnail file path for a given hash and tier
 /// Format: {thumbs_dir}/{tier}/{hash[0:2]}/{hash}.webp
@@ -62,7 +68,7 @@ pub fn generate_thumbnails(
     thumbs_dir: &Path,
     hash: &str,
     orientation: Option<u32>,
-) -> Result<Vec<(u32, PathBuf)>, String> {
+) -> Result<Vec<GeneratedThumbnail>, String> {
     let img = image::open(image_path)
         .map_err(|e| format!("Failed to open image: {}", e))?;
 
@@ -92,6 +98,7 @@ pub fn generate_thumbnails(
 
         // Resize image using fast_image_resize
         let resized = resize_to_tier_fast(&img, tier);
+        let (width, height) = resized.dimensions();
 
         // Encode to lossy WebP
         let webp_data = encode_webp_lossy(&resized);
@@ -100,7 +107,7 @@ pub fn generate_thumbnails(
         std::fs::write(&path, webp_data)
             .map_err(|e| format!("Failed to write thumbnail: {}", e))?;
 
-        results.push((tier, path));
+        results.push(GeneratedThumbnail { tier, path, width, height });
     }
 
     Ok(results)
@@ -113,7 +120,7 @@ pub fn generate_thumbnails_from_bytes(
     thumbs_dir: &Path,
     hash: &str,
     orientation: Option<u32>,
-) -> Result<Vec<(u32, PathBuf)>, String> {
+) -> Result<Vec<GeneratedThumbnail>, String> {
     let img = image::load_from_memory(image_bytes)
         .map_err(|e| format!("Failed to decode image from bytes: {}", e))?;
 
@@ -130,12 +137,13 @@ pub fn generate_thumbnails_from_bytes(
         }
 
         let resized = resize_to_tier_fast(&img, tier);
+        let (width, height) = resized.dimensions();
         let webp_data = encode_webp_lossy(&resized);
 
         std::fs::write(&path, webp_data)
             .map_err(|e| format!("Failed to write thumbnail: {}", e))?;
 
-        results.push((tier, path));
+        results.push(GeneratedThumbnail { tier, path, width, height });
     }
 
     Ok(results)
@@ -181,20 +189,13 @@ fn resize_to_tier_fast(img: &DynamicImage, tier: u32) -> DynamicImage {
 
 /// Encode an image to lossy WebP format
 fn encode_webp_lossy(img: &DynamicImage) -> Vec<u8> {
-    let rgb = img.to_rgb8();
-    let mut cursor = Cursor::new(Vec::new());
-    let encoder = WebPEncoder::new_lossless(&mut cursor);
-    use image::ExtendedColorType;
-    encoder.encode(rgb.as_raw(), rgb.width(), rgb.height(), ExtendedColorType::Rgb8).unwrap_or(());
-    let lossless_data = cursor.into_inner();
-
-    // Try to use the webp crate for lossy encoding
-    // If it fails (e.g., not available), fall back to lossless
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
-    match webp::Encoder::from_rgba(rgba.as_raw(), w, h).encode(WEBP_QUALITY) {
-        encoded if !encoded.is_empty() => encoded.to_vec(),
-        _ => lossless_data,
+    let encoded = webp::Encoder::from_rgba(rgba.as_raw(), w, h).encode(WEBP_QUALITY);
+    if !encoded.is_empty() {
+        encoded.to_vec()
+    } else {
+        Vec::new()
     }
 }
 
@@ -405,9 +406,11 @@ mod tests {
         let results = generate_thumbnails(&img_path, &thumbs_dir, "testhash123", Some(1)).unwrap();
 
         assert_eq!(results.len(), 3);
-        for (tier, path) in &results {
-            assert!(path.exists());
-            assert!(path.to_string_lossy().contains(&tier.to_string()));
+        for thumb in &results {
+            assert!(thumb.path.exists());
+            assert!(thumb.path.to_string_lossy().contains(&thumb.tier.to_string()));
+            assert!(thumb.width > 0);
+            assert!(thumb.height > 0);
         }
     }
 
