@@ -10,6 +10,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use tauri::Emitter;
 
 pub type DbPool = Pool<SqliteConnectionManager>;
 
@@ -105,13 +106,21 @@ pub fn library_add(state: tauri::State<'_, AppState>, path: String) -> Result<da
 }
 
 #[tauri::command]
-pub fn library_scan(state: tauri::State<'_, AppState>, id: i64) -> Result<dao::ScanJob, String> {
+pub fn library_scan(state: tauri::State<'_, AppState>, id: i64) -> Result<(), String> {
     let conn = state.db.get().map_err(|e| format!("Failed to get DB connection: {}", e))?;
     let library = dao::get_library(&conn, id).map_err(|e| format!("Library not found: {}", e))?;
 
     let root = Path::new(&library.root_path);
     if !root.exists() {
         return Err(format!("Library root path does not exist: {}", library.root_path));
+    }
+
+    // Reject if a scan is already running for this library
+    {
+        let tokens = state.scan_cancel_tokens.lock().map_err(|e| e.to_string())?;
+        if tokens.contains_key(&id) {
+            return Err("A scan is already running for this library".to_string());
+        }
     }
 
     // Create cancellation token and register it
@@ -121,26 +130,9 @@ pub fn library_scan(state: tauri::State<'_, AppState>, id: i64) -> Result<dao::S
         tokens.insert(id, cancel.clone());
     }
 
-    // Run scan synchronously with batched transactions
-    let result = orchestrator::run_scan(&conn, id, root, Some(&cancel), None);
-
-    // Remove cancellation token
-    {
-        let mut tokens = state.scan_cancel_tokens.lock().map_err(|e| e.to_string())?;
-        tokens.remove(&id);
-    }
-
-    result?;
-
-    // Hand thumbnail generation off to the background TaskQueue so the IPC
-    // call returns immediately and the CPU pool can parallelize the work.
-    let pending = pending_thumbnail_photo_ids(&conn, id)?;
-    if !pending.is_empty() {
-        state.task_queue.enqueue(Task::ThumbnailPrefetch { photo_ids: pending });
-    }
-
-    let job = get_latest_scan_job(&conn, id)?;
-    Ok(job)
+    // Enqueue scan on the background IO pool
+    state.task_queue.enqueue(Task::ScanLibrary { library_id: id, resume_job_id: None });
+    Ok(())
 }
 
 #[tauri::command]
@@ -155,7 +147,7 @@ pub fn library_scan_pause(state: tauri::State<'_, AppState>, id: i64) -> Result<
 }
 
 #[tauri::command]
-pub fn library_scan_resume(state: tauri::State<'_, AppState>, id: i64) -> Result<dao::ScanJob, String> {
+pub fn library_scan_resume(state: tauri::State<'_, AppState>, id: i64) -> Result<(), String> {
     let conn = state.db.get().map_err(|e| format!("Failed to get DB connection: {}", e))?;
     let library = dao::get_library(&conn, id).map_err(|e| format!("Library not found: {}", e))?;
 
@@ -170,6 +162,14 @@ pub fn library_scan_resume(state: tauri::State<'_, AppState>, id: i64) -> Result
     let job = resumable.into_iter().find(|j| j.status == "paused")
         .ok_or_else(|| "No paused scan job found".to_string())?;
 
+    // Reject if a scan is already running for this library
+    {
+        let tokens = state.scan_cancel_tokens.lock().map_err(|e| e.to_string())?;
+        if tokens.contains_key(&id) {
+            return Err("A scan is already running for this library".to_string());
+        }
+    }
+
     // Create cancellation token
     let cancel = orchestrator::new_cancellation_token();
     {
@@ -177,23 +177,9 @@ pub fn library_scan_resume(state: tauri::State<'_, AppState>, id: i64) -> Result
         tokens.insert(id, cancel.clone());
     }
 
-    // Resume scan from cursor
-    let result = orchestrator::run_scan(&conn, id, root, Some(&cancel), Some(job.id));
-
-    {
-        let mut tokens = state.scan_cancel_tokens.lock().map_err(|e| e.to_string())?;
-        tokens.remove(&id);
-    }
-
-    result?;
-
-    let pending = pending_thumbnail_photo_ids(&conn, id)?;
-    if !pending.is_empty() {
-        state.task_queue.enqueue(Task::ThumbnailPrefetch { photo_ids: pending });
-    }
-
-    let job = get_latest_scan_job(&conn, id)?;
-    Ok(job)
+    // Enqueue resume scan on the background IO pool
+    state.task_queue.enqueue(Task::ScanLibrary { library_id: id, resume_job_id: Some(job.id) });
+    Ok(())
 }
 
 /// Find photos in this library that don't yet have all three thumbnail tiers.
@@ -287,9 +273,12 @@ pub fn run_thumbnail_prefetch(pool: &DbPool, thumbs: &Path, photo_ids: &[i64]) {
     }
 }
 
-/// Construct the handler closure used by the lib-wide TaskQueue. Kept as a
-/// constructor so the same closure logic can be reused from tests.
-pub fn make_task_handler(
+/// Shared handle to the TaskQueue, populated after construction.
+pub type SharedTaskQueue = Arc<std::sync::OnceLock<Arc<TaskQueue>>>;
+
+/// Construct a handler that only processes ThumbnailPrefetch — used in tests
+/// where a Tauri AppHandle is not available.
+pub fn make_thumbnail_handler(
     pool: DbPool,
     thumbs: PathBuf,
 ) -> impl Fn(&Task, &crate::core::tasks::CancellationToken) + Send + Sync + 'static {
@@ -299,6 +288,124 @@ pub fn make_task_handler(
         }
         other => {
             eprintln!("TaskQueue: variant {:?} not yet wired", other);
+        }
+    }
+}
+
+/// Construct the full handler closure used by the lib-wide TaskQueue,
+/// including ScanLibrary support with event emission.
+pub fn make_task_handler(
+    pool: DbPool,
+    thumbs: PathBuf,
+    app_handle: tauri::AppHandle,
+    scan_cancel_tokens: Arc<Mutex<std::collections::HashMap<i64, orchestrator::CancellationToken>>>,
+    task_queue_ref: SharedTaskQueue,
+) -> impl Fn(&Task, &crate::core::tasks::CancellationToken) + Send + Sync + 'static {
+    move |task, _cancel| match task {
+        Task::ThumbnailPrefetch { photo_ids } => {
+            run_thumbnail_prefetch(&pool, &thumbs, photo_ids);
+        }
+        Task::ScanLibrary { library_id, resume_job_id } => {
+            run_scan_task(&pool, &thumbs, &app_handle, &scan_cancel_tokens, &task_queue_ref, *library_id, *resume_job_id);
+        }
+        other => {
+            eprintln!("TaskQueue: variant {:?} not yet wired", other);
+        }
+    }
+}
+
+/// Execute a library scan on the IO worker, then emit events and enqueue thumbnails.
+fn run_scan_task(
+    pool: &DbPool,
+    _thumbs: &Path,
+    app_handle: &tauri::AppHandle,
+    scan_cancel_tokens: &Arc<Mutex<std::collections::HashMap<i64, orchestrator::CancellationToken>>>,
+    task_queue_ref: &SharedTaskQueue,
+    library_id: i64,
+    resume_job_id: Option<i64>,
+) {
+    let conn = match pool.get() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ScanLibrary: failed to acquire DB connection: {}", e);
+            let _ = app_handle.emit("scan-error", serde_json::json!({ "library_id": library_id, "error": e.to_string() }));
+            return;
+        }
+    };
+
+    let library = match dao::get_library(&conn, library_id) {
+        Ok(lib) => lib,
+        Err(e) => {
+            eprintln!("ScanLibrary: library not found: {}", e);
+            let _ = app_handle.emit("scan-error", serde_json::json!({ "library_id": library_id, "error": e.to_string() }));
+            return;
+        }
+    };
+
+    let root = Path::new(&library.root_path);
+    if !root.exists() {
+        let msg = format!("Library root path does not exist: {}", library.root_path);
+        eprintln!("ScanLibrary: {}", msg);
+        let _ = app_handle.emit("scan-error", serde_json::json!({ "library_id": library_id, "error": msg }));
+        return;
+    }
+
+    // Get the cancel token for this library
+    let cancel_token = {
+        let tokens = match scan_cancel_tokens.lock() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("ScanLibrary: failed to lock cancel tokens: {}", e);
+                return;
+            }
+        };
+        tokens.get(&library_id).cloned()
+    };
+
+    let cancel_ref = cancel_token.as_ref();
+
+    // Run the scan
+    let result = orchestrator::run_scan(&conn, library_id, root, cancel_ref, resume_job_id);
+
+    // Clean up cancel token
+    {
+        if let Ok(mut tokens) = scan_cancel_tokens.lock() {
+            tokens.remove(&library_id);
+        }
+    }
+
+    match result {
+        Ok(scan_result) => {
+            // Enqueue thumbnail generation for newly scanned photos
+            match pending_thumbnail_photo_ids(&conn, library_id) {
+                Ok(pending) if !pending.is_empty() => {
+                    if let Some(q) = task_queue_ref.get() {
+                        q.enqueue(Task::ThumbnailPrefetch { photo_ids: pending });
+                    }
+                }
+                _ => {}
+            }
+
+            let job = get_latest_scan_job(&conn, library_id).ok();
+            let _ = app_handle.emit("scan-complete", serde_json::json!({
+                "library_id": library_id,
+                "result": scan_result,
+                "job": job,
+            }));
+        }
+        Err(e) if e == "Scan cancelled" => {
+            let job = get_latest_scan_job(&conn, library_id).ok();
+            let _ = app_handle.emit("scan-paused", serde_json::json!({
+                "library_id": library_id,
+                "job": job,
+            }));
+        }
+        Err(e) => {
+            eprintln!("ScanLibrary: scan failed: {}", e);
+            let _ = app_handle.emit("scan-error", serde_json::json!({
+                "library_id": library_id,
+                "error": e,
+            }));
         }
     }
 }

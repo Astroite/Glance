@@ -2,7 +2,7 @@ pub mod commands;
 pub mod core;
 pub mod error;
 
-use commands::AppState;
+use commands::{AppState, SharedTaskQueue};
 use core::db::{self, thumbs_dir};
 use core::tasks::TaskQueue;
 use core::thumbnail;
@@ -10,7 +10,7 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::Manager;
 
 const RAW_FORMATS: &[&str] = &["arw", "cr2", "cr3", "nef", "orf", "rw2", "dng", "raf"];
@@ -49,12 +49,23 @@ pub fn run() {
             let cpu_workers = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4);
-            let handler = commands::make_task_handler(pool.clone(), thumbs_dir());
+            let scan_cancel_tokens = Arc::new(Mutex::new(HashMap::new()));
+            let task_queue_ref: SharedTaskQueue = Arc::new(OnceLock::new());
+            let handler = commands::make_task_handler(
+                pool.clone(),
+                thumbs_dir(),
+                app.handle().clone(),
+                scan_cancel_tokens.clone(),
+                task_queue_ref.clone(),
+            );
             let queue = Arc::new(TaskQueue::new(3, cpu_workers, handler));
+            // Safe: workers only run after TaskQueue::new returns, and they
+            // block on the condvar until a task is enqueued.
+            let _ = task_queue_ref.set(queue.clone());
 
             app.manage(AppState {
                 db: pool,
-                scan_cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
+                scan_cancel_tokens,
                 task_queue: queue,
             });
 

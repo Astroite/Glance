@@ -26,8 +26,8 @@ pub enum Task {
     ThumbnailOnDemand { photo_id: i64, tier: u32 },
     /// Prefetch thumbnails after scan completes
     ThumbnailPrefetch { photo_ids: Vec<i64> },
-    /// Run a library scan
-    ScanLibrary { library_id: i64 },
+    /// Run a library scan (resume_job_id = Some for resume)
+    ScanLibrary { library_id: i64, resume_job_id: Option<i64> },
     /// Extract metadata for a specific photo file
     MetadataExtraction { photo_file_id: i64 },
     /// Garbage orphan thumbnails
@@ -316,7 +316,7 @@ mod tests {
             let (lock, _) = &*state;
             let mut s = lock.lock().unwrap();
             s.heap.push(PrioritizedTask { task: Task::OrphanGc, priority: TaskPriority::Low, seq: 0 });
-            s.heap.push(PrioritizedTask { task: Task::ScanLibrary { library_id: 1 }, priority: TaskPriority::Normal, seq: 1 });
+            s.heap.push(PrioritizedTask { task: Task::ScanLibrary { library_id: 1, resume_job_id: None }, priority: TaskPriority::Normal, seq: 1 });
             s.heap.push(PrioritizedTask { task: Task::ThumbnailOnDemand { photo_id: 1, tier: 240 }, priority: TaskPriority::High, seq: 2 });
         }
 
@@ -334,7 +334,7 @@ mod tests {
     #[test]
     fn test_task_pool_assignment() {
         assert_eq!(Task::ThumbnailOnDemand { photo_id: 1, tier: 240 }.pool(), Pool::Cpu);
-        assert_eq!(Task::ScanLibrary { library_id: 1 }.pool(), Pool::Io);
+        assert_eq!(Task::ScanLibrary { library_id: 1, resume_job_id: None }.pool(), Pool::Io);
         assert_eq!(Task::OrphanGc.pool(), Pool::Io);
     }
 
@@ -403,7 +403,7 @@ mod tests {
         });
 
         // Enqueue IO and CPU tasks
-        queue.enqueue(Task::ScanLibrary { library_id: 1 }); // IO
+        queue.enqueue(Task::ScanLibrary { library_id: 1, resume_job_id: None }); // IO
         queue.enqueue(Task::ThumbnailOnDemand { photo_id: 1, tier: 240 }); // CPU
         queue.enqueue(Task::MetadataExtraction { photo_file_id: 1 }); // IO
         queue.enqueue(Task::ThumbnailPrefetch { photo_ids: vec![1, 2] }); // CPU
@@ -416,7 +416,7 @@ mod tests {
 
     #[test]
     fn test_thumbnail_prefetch_via_queue() {
-        use crate::commands::make_task_handler;
+        use crate::commands::make_thumbnail_handler;
         use crate::core::db;
         use crate::core::db::dao;
         use image::{ImageBuffer, Rgb, RgbImage};
@@ -470,7 +470,7 @@ mod tests {
             photo.id
         };
 
-        let handler = make_task_handler(pool.clone(), thumbs_dir.clone());
+        let handler = make_thumbnail_handler(pool.clone(), thumbs_dir.clone());
         let queue = TaskQueue::new(1, 1, handler);
 
         queue.enqueue(Task::ThumbnailPrefetch { photo_ids: vec![photo_id] });
@@ -509,7 +509,7 @@ mod tests {
 
         assert_eq!(queue.depth(), 0);
 
-        queue.enqueue(Task::ScanLibrary { library_id: 1 });
+        queue.enqueue(Task::ScanLibrary { library_id: 1, resume_job_id: None });
         queue.enqueue(Task::ThumbnailOnDemand { photo_id: 1, tier: 240 });
 
         // Give a moment for the queue to be populated

@@ -5,11 +5,12 @@ import { Timeline } from './views/Timeline';
 import './styles/global.css';
 
 function App() {
-  const { selectedLibrary, loadLibraries } = useLibraryStore();
+  const { selectedLibrary, loadLibraries, _setupListeners } = useLibraryStore();
 
   useEffect(() => {
+    _setupListeners();
     loadLibraries();
-  }, [loadLibraries]);
+  }, [_setupListeners, loadLibraries]);
 
   return (
     <div className="app">

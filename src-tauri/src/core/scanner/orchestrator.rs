@@ -12,7 +12,7 @@ use std::sync::Arc;
 const BATCH_SIZE: usize = 200;
 
 /// Result of a scan
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ScanResult {
     pub added: i64,
     pub updated: i64,
